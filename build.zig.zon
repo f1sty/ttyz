@@ -1,0 +1,17 @@
+.{
+    .name = .zig_sandbox,
+    .version = "0.0.1",
+    .dependencies = .{
+        .zglfw = .{
+            .url = "git+https://github.com/IridescenceTech/zglfw.git#e05188a71db6053ec56bba83a27fb736a26562ce",
+            .hash = "zglfw-0.1.0-BghZXabUAACfsXVTPWvmy44XLsc-wux2G9w8Mbp523pJ",
+        },
+        .zig_freetype2 = .{
+            .url = "git+https://github.com/PaNDa2code/zig_freetype2#74bbedfad57d7ccc2e12fba9162123ad8adaef42",
+            .hash = "zig_freetype2-0.0.0-Yvn9x8VwAABxwv6ArXvo2F5_yp-mH7didCapQLHpPqab",
+        },
+    },
+    .minimum_zig_version = "0.16.0-dev.1624+b9eefe17a",
+    .paths = .{""},
+    .fingerprint = 0x957ab73f4d92b1aa,
+}
