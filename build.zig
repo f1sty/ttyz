@@ -9,9 +9,9 @@ pub fn build(b: *std.Build) void {
     const freetype = b.dependency("zig_freetype2", .{ .target = target, .optimize = optimize });
     const zglfw = b.dependency("zglfw", .{ .target = target, .optimize = optimize });
 
-    const ansi_codes = b.createModule(.{ .target = target, .optimize = optimize, .root_source_file = b.path("src/ansi_codes.zig") });
+    const ansi_parser = b.createModule(.{ .target = target, .optimize = optimize, .root_source_file = b.path("src/AnsiParser.zig") });
 
-    exe.root_module.addImport("ascii_codes", ansi_codes);
+    exe.root_module.addImport("AnsiParser", ansi_parser);
     exe.root_module.addImport("glfw", zglfw.module("glfw"));
     exe.root_module.addImport("freetype", freetype.module("freetype"));
     exe.root_module.linkSystemLibrary("glfw3", .{});

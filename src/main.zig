@@ -1,7 +1,7 @@
 const std = @import("std");
 const glfw = @import("glfw");
 const freetype = @import("freetype");
-const ansi_codes = @import("ansi_codes.zig");
+const AnsiParser = @import("AnsiParser.zig");
 
 const c = @cImport({
     @cInclude("pty.h");
@@ -119,15 +119,14 @@ pub fn main() !void {
     const flags = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
     _ = try std.posix.fcntl(fd, std.posix.F.SETFL, flags | std.posix.SOCK.NONBLOCK);
 
-    // var reader: std.Io.Reader = .fixed(&buffer);
-    // const parsed = try ansi_codes.parse(allocator, &reader);
-
     c.glBindTexture(c.GL_TEXTURE_2D, characters_texture);
 
     var screen = try std.ArrayList(u8).initCapacity(allocator, std.heap.pageSize());
 
     _ = glfw.setCharCallback(window, &char_callback);
     glfw.setWindowUserPointer(window, &fd);
+
+    var parser = try AnsiParser.init(allocator);
 
     while (!glfw.windowShouldClose(window)) {
         c.glClearColor(0.1, 0.1, 0.1, 1.0);
@@ -140,7 +139,15 @@ pub fn main() !void {
         c.glColor4f(1, 1, 1, 1);
 
         if (std.posix.read(fd, &buffer)) |size| {
-            try screen.appendSlice(allocator, buffer[0..size]);
+            for (buffer[0..size]) |ch| {
+                std.debug.print("{x} : {c} | ", .{ch, ch});
+            }
+            std.debug.print("\n", .{});
+            const parsed = try parser.parse(buffer[0..size]);
+            for (parsed.items) |token| {
+                if (token.type == .printable) try screen.append(allocator, token.payload.?.character);
+            }
+            std.debug.print("{}\n", .{parsed});
         } else |err| switch (err) {
             error.WouldBlock => {},
             error.InputOutput => {
