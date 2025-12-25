@@ -43,7 +43,7 @@ pub fn main() !void {
     const pid = c.forkpty(&fd, null, null, null);
 
     if (pid == 0) {
-        std.process.execv(allocator, &.{"/usr/bin/sh"}) catch unreachable;
+        std.process.execv(allocator, &.{"/usr/bin/bash"}) catch unreachable;
         return;
     }
 
@@ -127,6 +127,7 @@ pub fn main() !void {
     glfw.setWindowUserPointer(window, &fd);
 
     var parser = try AnsiParser.init(allocator);
+    defer parser.deinit();
 
     while (!glfw.windowShouldClose(window)) {
         c.glClearColor(0.1, 0.1, 0.1, 1.0);
@@ -139,15 +140,10 @@ pub fn main() !void {
         c.glColor4f(1, 1, 1, 1);
 
         if (std.posix.read(fd, &buffer)) |size| {
-            for (buffer[0..size]) |ch| {
-                std.debug.print("{x} : {c} | ", .{ch, ch});
+            try parser.feed(buffer[0..size]);
+            for (try parser.drain()) |token| {
+                if (token.type != .special) try screen.append(allocator, token.payload.character);
             }
-            std.debug.print("\n", .{});
-            const parsed = try parser.parse(buffer[0..size]);
-            for (parsed.items) |token| {
-                if (token.type == .printable) try screen.append(allocator, token.payload.?.character);
-            }
-            std.debug.print("{}\n", .{parsed});
         } else |err| switch (err) {
             error.WouldBlock => {},
             error.InputOutput => {

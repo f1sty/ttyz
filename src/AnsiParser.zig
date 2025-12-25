@@ -1,11 +1,62 @@
 const std = @import("std");
 const AnsiParser = @This();
-const State = enum { start, c0, c1, csi, dcs, osc };
+const State = enum { start, c1, csi, dcs, osc, rxvt_graphics, dec_line, utf8_mode, char_control };
 const Token = struct {
-    type: Type = .unsupported,
-    payload: ?Payload = null,
+    type: Type,
+    payload: Payload,
 
-    const Type = enum { printable, unsupported, ich };
+    const Type = enum {
+        character,
+        special,
+        lf,
+        bel,
+        csi,
+        bs,
+        cr,
+        so,
+        si,
+        enq,
+        tab,
+        vt,
+        ff,
+        can,
+        sub,
+        decbi,
+        decsc,
+        decrc,
+        decfi,
+        nel,
+        esc_f,
+        hts,
+        ri,
+        ss1,
+        ss2,
+        spa,
+        epa,
+        decid,
+        ind,
+        lock,
+        unlock,
+        ls2,
+        ls3,
+        deckpnm,
+        deckpam,
+        ls3r,
+        ls2r,
+        ls1r,
+        decdhl,
+        decswl,
+        decdwl,
+        decaln,
+        utf8_enable_alias,
+        utf8_enable,
+        utf8_disable,
+        s7c1t,
+        s8c1t,
+        ansi1,
+        ansi2,
+        ansi3,
+    };
     const Payload = union {
         character: u8,
         single: usize,
@@ -13,139 +64,323 @@ const Token = struct {
         text: std.ArrayList(u8),
     };
 };
-const ParserError = error{ Unimplemented, EndOfStream, ReadFailed, OutOfMemory, StreamTooLong, InvalidCharacter, Overflow };
 
-state: State,
-reader: std.Io.Reader = undefined,
-internal_buffer: std.ArrayList(Token) = undefined,
+state: State = .start,
+tokens: std.ArrayList(Token),
+number_buffer: std.ArrayList(u8),
+numbers: std.ArrayList(usize),
 allocator: std.mem.Allocator,
 
 pub fn init(allocator: std.mem.Allocator) !AnsiParser {
-    return .{ .state = .start, .allocator = allocator };
-}
-
-pub fn parse(parser: *AnsiParser, buffer: []u8) ParserError!std.ArrayList(Token) {
-    const reader = std.Io.Reader.fixed(buffer);
-    const internal_buffer = try std.ArrayList(Token).initCapacity(parser.allocator, buffer.len);
-    parser.reader = reader;
-    parser.internal_buffer = internal_buffer;
-    parser.consume_char() catch |err| switch (err) {
-        error.EndOfStream => return parser.internal_buffer,
-        else => |leftover_err| return leftover_err,
+    return .{
+        .allocator = allocator,
+        .tokens = try std.ArrayList(Token).initCapacity(allocator, 2048),
+        .number_buffer = try std.ArrayList(u8).initCapacity(allocator, 4),
+        .numbers = try std.ArrayList(usize).initCapacity(allocator, 4),
     };
-    return error.Unimplemented;
 }
 
-fn consume_char(parser: *AnsiParser) ParserError!void {
-    switch (parser.state) {
-        .start => {
-            switch (try parser.reader.takeByte()) {
-                '\x1b' => {
-                    parser.state = .c1;
-                    try parser.consume_char();
-                },
-                else => |byte| {
-                    try parser.internal_buffer.append(parser.allocator, .{ .type = .printable, .payload = .{ .character = byte } });
-                    parser.state = .start;
-                    try parser.consume_char();
-                },
-            }
-        },
-        .c1 => {
-            switch (try parser.reader.takeByte()) {
-                '[' => {
-                    parser.state = .csi;
-                    try parser.consume_char();
-                },
-                ']' => {
-                    parser.state = .osc;
-                    try parser.consume_char();
-                },
-                'P' => {
-                    parser.state = .dcs;
-                    try parser.consume_char();
-                },
-                '=' => {
-                    parser.state = .start;
-                    try parser.consume_char();
-                },
-                '>' => {
-                    parser.state = .start;
-                    try parser.consume_char();
-                },
-                else => {
-                    return error.Unimplemented;
-                },
-            }
-        },
-        .csi => {
-            switch (try parser.reader.peekByte()) {
-                '0'...'9' => {
-                    try parser.consume_single();
-                    parser.state = .start;
-                },
-                '?' => {
-                    parser.reader.toss(1);
-                    try parser.consume_multiple();
-                },
-                '#' => {
-                    parser.reader.toss(1);
-                    try parser.consume_char();
-                    parser.state = .start;
-                },
-                '>' => {
-                    try parser.internal_buffer.append(parser.allocator, .{});
-                    parser.reader.toss(1);
-                    try parser.consume_char();
-                    parser.state = .start;
-                },
-                else => {
-                    return error.Unimplemented;
-                },
-            }
-        },
-        else => return error.Unimplemented,
+pub fn deinit(parser: *AnsiParser) void {
+    parser.tokens.deinit(parser.allocator);
+}
+
+pub fn feed(parser: *AnsiParser, buffer: []u8) !void {
+    for (buffer) |byte| {
+        // std.debug.print("feeding: {x} '{c}'\n", .{ byte, byte });
+        switch (parser.state) {
+            .start => try parser.stepStart(byte),
+            .csi => try parser.stepCsi(byte),
+            .c1 => try parser.stepC1(byte),
+            .dcs => try parser.stepDcs(byte),
+            .osc => try parser.stepOsc(byte),
+            .rxvt_graphics => try parser.stepRxvtGraphics(byte),
+            .dec_line => try parser.stepDecLine(byte),
+            .utf8_mode => try parser.stepUtf8Mode(byte),
+            .char_control => try parser.stepCharControl(byte),
+        }
     }
 }
 
-fn consume_single(parser: *AnsiParser) ParserError!void {
-    switch (parser.state) {
-        .csi => {
-            if (try parser.reader.takeDelimiter('@')) |string| {
-                const number = try std.fmt.parseInt(usize, string, 10);
-                try parser.internal_buffer.append(parser.allocator, .{ .type = .ich, .payload = .{ .single = number } });
-                parser.state = .start; // FIXME: handle CSI Ps SP @
-                try parser.consume_char();
-            }
+pub fn drain(parser: *AnsiParser) ![]Token {
+    return try parser.tokens.toOwnedSlice(parser.allocator);
+}
+
+fn stepStart(parser: *AnsiParser, byte: u8) !void {
+    switch (byte) {
+        '\x1b' => parser.state = .c1,
+        '\x05' => try parser.tokens.append(parser.allocator, .{ .type = .enq, .payload = .{ .character = byte } }),
+        '\x07' => try parser.tokens.append(parser.allocator, .{ .type = .bel, .payload = .{ .character = byte } }),
+        '\x08' => try parser.tokens.append(parser.allocator, .{ .type = .bs, .payload = .{ .character = byte } }),
+        '\x09' => try parser.tokens.append(parser.allocator, .{ .type = .tab, .payload = .{ .character = byte } }),
+        '\x0a' => try parser.tokens.append(parser.allocator, .{ .type = .lf, .payload = .{ .character = byte } }),
+        '\x0b' => try parser.tokens.append(parser.allocator, .{ .type = .vt, .payload = .{ .character = byte } }),
+        '\x0c' => try parser.tokens.append(parser.allocator, .{ .type = .ff, .payload = .{ .character = byte } }),
+        '\x0d' => try parser.tokens.append(parser.allocator, .{ .type = .cr, .payload = .{ .character = byte } }),
+        '\x0e' => try parser.tokens.append(parser.allocator, .{ .type = .so, .payload = .{ .character = byte } }),
+        '\x0f' => try parser.tokens.append(parser.allocator, .{ .type = .si, .payload = .{ .character = byte } }),
+        '\x18' => try parser.tokens.append(parser.allocator, .{ .type = .can, .payload = .{ .character = byte } }),
+        '\x1a' => try parser.tokens.append(parser.allocator, .{ .type = .sub, .payload = .{ .character = byte } }),
+        else => {
+            try parser.tokens.append(parser.allocator, .{ .type = .character, .payload = .{ .character = byte } });
         },
-        else => return error.Unimplemented,
     }
 }
 
-fn consume_multiple(parser: *AnsiParser) ParserError!void {
-    var number = try std.ArrayList(u8).initCapacity(parser.allocator, 4);
-    var multiple = try std.ArrayList(usize).initCapacity(parser.allocator, 4);
-    try switch (parser.state) {
-        .csi => {
-            while (true) {
-                const byte = try parser.reader.takeByte();
-                if (std.ascii.isDigit(byte)) {
-                    try number.append(parser.allocator, byte);
-                }
-                if (byte == ';') {
-                    const number_parsed = try std.fmt.parseInt(usize, number.items, 10);
-                    try multiple.append(parser.allocator, number_parsed);
-                }
-                if (byte == 'h' or byte == 'l') {
-                    const number_parsed = try std.fmt.parseInt(usize, number.items, 10);
-                    try multiple.append(parser.allocator, number_parsed);
-                    try parser.internal_buffer.append(parser.allocator, .{ .payload = .{ .multiple = multiple } });
-                    parser.state = .start; // FIXME: handle CSI Ps SP @
-                    try parser.consume_char();
-                    break;
-                }
+fn stepC1(parser: *AnsiParser, byte: u8) !void {
+    switch (byte) {
+        '[' => parser.state = .csi,
+        ']' => parser.state = .osc,
+        'P' => parser.state = .dcs,
+        '#' => parser.state = .dec_line,
+        '%' => parser.state = .utf8_mode,
+        ' ' => parser.state = .char_control,
+        '6' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .decbi, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        '7' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .decsc, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        '8' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .decrc, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        '9' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .decfi, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'D' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .ind, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'E' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .nel, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'F' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .esc_f, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'G' => parser.state = .rxvt_graphics,
+        'H' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .hts, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'M' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .ri, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'N' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .ss1, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'O' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .ss2, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'V' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .spa, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'W' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .epa, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'Z' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .decid, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'c' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .ind, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'l' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .lock, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'm' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .unlock, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'n' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .ls2, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'o' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .ls3, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        '>' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .deckpnm, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        '=' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .deckpam, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        '@' => parser.state = .rxvt_graphics,
+        '|' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .ls3r, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        '}' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .ls2r, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        '~' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .ls1r, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        else => return error.C1Unimplemented,
+    }
+}
+
+fn stepCsi(parser: *AnsiParser, byte: u8) !void {
+    switch (byte) {
+        '0'...'9' => {
+            try parser.number_buffer.append(parser.allocator, byte);
+        },
+        '@' => {
+            const number = try std.fmt.parseInt(usize, parser.number_buffer.items, 10);
+            try parser.tokens.append(parser.allocator, .{ .type = .special, .payload = .{ .single = number } });
+            parser.resetCsi();
+        },
+        ';' => {
+            if (parser.number_buffer.items.len == 0) {
+                try parser.numbers.append(parser.allocator, 1);
+            } else {
+                try parser.numbers.append(parser.allocator, try std.fmt.parseInt(usize, parser.number_buffer.items, 10));
             }
         },
-        else => error.Unimplemented,
-    };
+        ' ' => {},
+        '?' => {},
+        'm' => {
+            parser.resetCsi();
+        },
+        'H' => {
+            parser.resetCsi();
+        },
+        'J' => {
+            parser.resetCsi();
+        },
+        'h' => {
+            const number = std.fmt.parseInt(usize, parser.number_buffer.items, 10) catch 1;
+            try parser.tokens.append(parser.allocator, .{ .type = .special, .payload = .{ .single = number } });
+            parser.resetCsi();
+        },
+        'l' => {
+            const number = std.fmt.parseInt(usize, parser.number_buffer.items, 10) catch 1;
+            try parser.tokens.append(parser.allocator, .{ .type = .special, .payload = .{ .single = number } });
+            parser.resetCsi();
+        },
+        'K' => {
+            const number = std.fmt.parseInt(usize, parser.number_buffer.items, 10) catch 1;
+            try parser.tokens.append(parser.allocator, .{ .type = .special, .payload = .{ .single = number } });
+            parser.resetCsi();
+        },
+        else => return error.CsiUnimplemented,
+    }
+}
+
+fn stepOsc(parser: *AnsiParser, byte: u8) !void {
+    switch (byte) {
+        '0' => parser.state = .start, // not implemented
+        else => return error.OscUnimplemented,
+    }
+}
+
+fn stepDcs(parser: *AnsiParser, byte: u8) !void {
+    switch (byte) {
+        '[' => parser.state = .csi,
+        ']' => parser.state = .osc,
+        'P' => parser.state = .dcs,
+        else => return error.DcsUnimplemented,
+    }
+}
+
+fn stepRxvtGraphics(parser: *AnsiParser, byte: u8) !void {
+    switch (byte) {
+        '0'...'9' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .special, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        else => return error.UnknownRxvtGraphicsParam,
+    }
+}
+
+fn stepDecLine(parser: *AnsiParser, byte: u8) !void {
+    switch (byte) {
+        '3' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .decdhl, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        '4' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .decdhl, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        '5' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .decswl, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        '6' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .decdwl, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        '8' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .decaln, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        else => return error.DeclineUnimplemented,
+    }
+}
+
+fn stepUtf8Mode(parser: *AnsiParser, byte: u8) !void {
+    switch (byte) {
+        '8' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .utf8_enable_alias, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'G' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .utf8_enable, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        '@' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .utf8_disable, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        else => return error.Utf8ModeUnimplmented,
+    }
+}
+
+fn stepCharControl(parser: *AnsiParser, byte: u8) !void {
+    switch (byte) {
+        'F' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .s7c1t, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'G' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .s8c1t, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'L' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .ansi1, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'M' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .ansi2, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        'N' => {
+            try parser.tokens.append(parser.allocator, .{ .type = .ansi3, .payload = .{ .character = byte } });
+            parser.state = .start;
+        },
+        else => return error.CharControlUnimplemented,
+    }
+}
+
+fn resetCsi(parser: *AnsiParser) void {
+    parser.number_buffer.clearRetainingCapacity();
+    parser.numbers.clearRetainingCapacity();
+    parser.state = .start;
 }
