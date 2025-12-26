@@ -1,6 +1,6 @@
 const std = @import("std");
 const AnsiParser = @This();
-const State = enum { start, c1, csi, dcs, osc, rxvt_graphics, dec_line, utf8_mode, char_control };
+const State = enum { start, c1, csi, dcs, osc, rxvt_graphics, dec_line, utf8_mode, char_control, st, dsr };
 const Token = struct {
     type: Type,
     payload: Payload,
@@ -68,6 +68,7 @@ const Token = struct {
 state: State = .start,
 tokens: std.ArrayList(Token),
 number_buffer: std.ArrayList(u8),
+string_buffer: std.ArrayList(u8),
 numbers: std.ArrayList(usize),
 allocator: std.mem.Allocator,
 
@@ -76,6 +77,7 @@ pub fn init(allocator: std.mem.Allocator) !AnsiParser {
         .allocator = allocator,
         .tokens = try std.ArrayList(Token).initCapacity(allocator, 2048),
         .number_buffer = try std.ArrayList(u8).initCapacity(allocator, 4),
+        .string_buffer = try std.ArrayList(u8).initCapacity(allocator, 4),
         .numbers = try std.ArrayList(usize).initCapacity(allocator, 4),
     };
 }
@@ -97,6 +99,8 @@ pub fn feed(parser: *AnsiParser, buffer: []u8) !void {
             .dec_line => try parser.stepDecLine(byte),
             .utf8_mode => try parser.stepUtf8Mode(byte),
             .char_control => try parser.stepCharControl(byte),
+            .st => try parser.stepSt(byte),
+            .dsr => try parser.stepDsr(byte),
         }
     }
 }
@@ -134,6 +138,7 @@ fn stepC1(parser: *AnsiParser, byte: u8) !void {
         '#' => parser.state = .dec_line,
         '%' => parser.state = .utf8_mode,
         ' ' => parser.state = .char_control,
+        '\\' => parser.state = .st,
         '6' => {
             try parser.tokens.append(parser.allocator, .{ .type = .decbi, .payload = .{ .character = byte } });
             parser.state = .start;
@@ -244,7 +249,7 @@ fn stepCsi(parser: *AnsiParser, byte: u8) !void {
         '@' => {
             const number = try std.fmt.parseInt(usize, parser.number_buffer.items, 10);
             try parser.tokens.append(parser.allocator, .{ .type = .special, .payload = .{ .single = number } });
-            parser.resetCsi();
+            parser.resetBuffers();
         },
         ';' => {
             if (parser.number_buffer.items.len == 0) {
@@ -256,28 +261,28 @@ fn stepCsi(parser: *AnsiParser, byte: u8) !void {
         ' ' => {},
         '?' => {},
         'm' => {
-            parser.resetCsi();
+            parser.resetBuffers();
         },
         'H' => {
-            parser.resetCsi();
+            parser.resetBuffers();
         },
         'J' => {
-            parser.resetCsi();
+            parser.resetBuffers();
         },
         'h' => {
             const number = std.fmt.parseInt(usize, parser.number_buffer.items, 10) catch 1;
             try parser.tokens.append(parser.allocator, .{ .type = .special, .payload = .{ .single = number } });
-            parser.resetCsi();
+            parser.resetBuffers();
         },
         'l' => {
             const number = std.fmt.parseInt(usize, parser.number_buffer.items, 10) catch 1;
             try parser.tokens.append(parser.allocator, .{ .type = .special, .payload = .{ .single = number } });
-            parser.resetCsi();
+            parser.resetBuffers();
         },
         'K' => {
             const number = std.fmt.parseInt(usize, parser.number_buffer.items, 10) catch 1;
             try parser.tokens.append(parser.allocator, .{ .type = .special, .payload = .{ .single = number } });
-            parser.resetCsi();
+            parser.resetBuffers();
         },
         else => return error.CsiUnimplemented,
     }
@@ -285,8 +290,11 @@ fn stepCsi(parser: *AnsiParser, byte: u8) !void {
 
 fn stepOsc(parser: *AnsiParser, byte: u8) !void {
     switch (byte) {
-        '0' => parser.state = .start, // not implemented
-        else => return error.OscUnimplemented,
+        '\x1b' => parser.state = .c1,
+        '?' => parser.state = .dsr,
+        else => {
+            try parser.string_buffer.append(parser.allocator, byte);
+        },
     }
 }
 
@@ -379,8 +387,32 @@ fn stepCharControl(parser: *AnsiParser, byte: u8) !void {
     }
 }
 
-fn resetCsi(parser: *AnsiParser) void {
+fn stepSt(parser: *AnsiParser, byte: u8) !void {
+    _ = byte;
+    if (parser.string_buffer.items.len != 0) {
+        try parser.tokens.append(parser.allocator, .{ .type = .special, .payload = .{ .text = parser.string_buffer } });
+    }
+    parser.resetBuffers();
+    parser.state = .start;
+}
+
+fn stepDsr(parser: *AnsiParser, byte: u8) !void {
+    switch (byte) {
+        '0'...'9' => try parser.number_buffer.append(parser.allocator, byte),
+        'h' => {
+            if (parser.number_buffer.items.len > 0) {
+                try parser.tokens.append(parser.allocator, .{ .type = .special, .payload = .{ .single = try std.fmt.parseInt(usize, parser.number_buffer.items, 10) } });
+                parser.resetBuffers();
+            }
+            parser.state = .start;
+        },
+        else => return error.DsrUnimplemented,
+    }
+}
+
+fn resetBuffers(parser: *AnsiParser) void {
     parser.number_buffer.clearRetainingCapacity();
+    parser.string_buffer.clearRetainingCapacity();
     parser.numbers.clearRetainingCapacity();
     parser.state = .start;
 }

@@ -10,8 +10,12 @@ pub fn build(b: *std.Build) void {
     const zglfw = b.dependency("zglfw", .{ .target = target, .optimize = optimize });
 
     const ansi_parser = b.createModule(.{ .target = target, .optimize = optimize, .root_source_file = b.path("src/AnsiParser.zig") });
+    const gui = b.createModule(.{ .target = target, .optimize = optimize, .root_source_file = b.path("src/Gui.zig") });
+    const terminal = b.createModule(.{ .target = target, .optimize = optimize, .root_source_file = b.path("src/Terminal.zig") });
 
     exe.root_module.addImport("AnsiParser", ansi_parser);
+    exe.root_module.addImport("Gui", gui);
+    exe.root_module.addImport("Terminal", terminal);
     exe.root_module.addImport("glfw", zglfw.module("glfw"));
     exe.root_module.addImport("freetype", freetype.module("freetype"));
     exe.root_module.linkSystemLibrary("glfw3", .{});
